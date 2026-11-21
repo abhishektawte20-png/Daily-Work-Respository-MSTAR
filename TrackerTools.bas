@@ -138,52 +138,173 @@ Private Function AppendLogRows(ByVal nm As String, ByVal d1 As Date, ByVal d2 As
 End Function
 
 ' ---------------------------------------------------------------- JOINER
-Public Sub AddJoiner()
-    Dim wr As Worksheet, nm As String, id As String, lead As String, grp As String
-    Dim ok As Boolean, startD As Date, rampD As Date, hasRamp As Boolean, r As Long
-    Dim s As String, n As Long, yr As Long
+Private Sub AppendRampRow(ByVal nm As String, ByVal d As Date, ByVal stg As String)
+    Dim w As Worksheet, r As Long
+    Set w = Sh("Ramping")
+    r = FirstEmptyRow(w, 8, 7, 206)
+    If r = 0 Then
+        MsgBox "The ramp-progress table is full (200 rows).", vbExclamation
+        Exit Sub
+    End If
+    w.Cells(r, 8).Value = nm
+    w.Cells(r, 9).Value = d
+    w.Cells(r, 9).NumberFormat = "dd-mmm-yyyy"
+    w.Cells(r, 10).Value = stg
+End Sub
+
+Private Function FirstStage() As String
+    Dim c As Range
+    For Each c In Sh("Ramping").Range("F7:F16").Cells
+        If Len(Trim$(CStr(c.Value))) > 0 Then
+            FirstStage = Trim$(CStr(c.Value))
+            Exit Function
+        End If
+    Next c
+End Function
+
+' returns number of daily rows created, or -1 if the person could not be added
+Private Function CreateJoiner(ByVal nm As String, ByVal id As String, ByVal lead As String, ByVal grp As String, _
+                              ByVal startD As Date, ByVal ramp As Boolean, ByVal batch As String) As Long
+    Dim wr As Worksheet, r As Long, yr As Long
     Set wr = Sh("Roster")
+    CreateJoiner = -1
+    If Application.WorksheetFunction.CountIf(wr.Range("B" & ROST_FIRST & ":B" & ROST_LAST), nm) > 0 Then Exit Function
+    yr = CLng(Sh("Settings").Range("B3").Value)
+    If Year(startD) > yr Then Exit Function
+    r = FirstEmptyRow(wr, 2, ROST_FIRST, ROST_LAST)
+    If r = 0 Then Exit Function
+    wr.Cells(r, 1).Value = id
+    wr.Cells(r, 2).Value = nm
+    wr.Cells(r, 3).Value = lead
+    wr.Cells(r, 4).Value = batch
+    wr.Cells(r, 5).Value = startD
+    wr.Cells(r, 8).Value = grp
+    wr.Cells(r, 10).Value = startD
+    If ramp Then AppendRampRow nm, startD, FirstStage()
+    CreateJoiner = AppendLogRows(nm, startD, DateSerial(yr, 12, 31))
+End Function
+
+Public Sub AddJoiner()
+    Dim nm As String, id As String, lead As String, grp As String, ok As Boolean
+    Dim startD As Date, ramp As Boolean, n As Long, ans As String
     nm = Trim$(InputBox("Full name of the new joiner:", "Add joiner (1/5)"))
     If nm = "" Then Exit Sub
-    If Application.WorksheetFunction.CountIf(wr.Range("B" & ROST_FIRST & ":B" & ROST_LAST), nm) > 0 Then
+    If Application.WorksheetFunction.CountIf(Sh("Roster").Range("B" & ROST_FIRST & ":B" & ROST_LAST), nm) > 0 Then
         MsgBox "'" & nm & "' is already on the Roster. To change their team use 'Move Team'.", vbExclamation
         Exit Sub
     End If
     id = Trim$(InputBox("Employee ID (can be left blank):", "Add joiner (2/5)"))
     lead = ChooseFrom("Add joiner (3/5) - team lead", Sh("Teams").Range("A7:A26"))
     If lead = "" Then Exit Sub
-    grp = ChooseFrom("Add joiner (4/5) - base-target group", Sh("Base_Targets").Range("A7:A16"))
+    grp = ChooseFrom("Add joiner (4/5) - target group (used after ramp-up)", Sh("Base_Targets").Range("A7:A16"))
     If grp = "" Then Exit Sub
     startD = AskDate("First working day (dd-mmm-yyyy):", "Add joiner (5/5)", Format(Date, "dd-mmm-yyyy"), ok)
     If Not ok Then Exit Sub
-    s = Trim$(InputBox("Is the person ramping? Enter the date ramp-up ENDS (dd-mmm-yyyy), or leave blank if already ramped:", "Add joiner - optional"))
-    If s <> "" Then
-        If Not IsDate(s) Then
-            MsgBox "Not a valid date - joiner NOT added.", vbExclamation
-            Exit Sub
+    ans = MsgBox("Is " & nm & " going through the RAMPING programme (week-by-week targets)?", vbYesNo + vbQuestion, "Ramping?")
+    ramp = (ans = vbYes)
+    n = CreateJoiner(nm, id, lead, grp, startD, ramp, "")
+    If n < 0 Then
+        MsgBox "Could not add " & nm & " (start date after the tracker year, or Roster full).", vbExclamation
+        Exit Sub
+    End If
+    MsgBox nm & " added to " & lead & "." & vbLf & n & " daily rows created in Daily_Log (weekends included, shaded)." & _
+           IIf(ramp, vbLf & "Started in " & FirstStage() & " on the Ramping tab.", ""), vbInformation, "Done"
+End Sub
+
+Public Sub AddRampBatch()
+    Dim names As String, parts() As String, i As Long, nm As String, lead As String, grp As String
+    Dim ok As Boolean, startD As Date, batch As String, n As Long, added As Long, skipped As String
+    names = Trim$(InputBox("Type ALL the names in the new batch, separated by a semicolon ( ; )" & vbLf & _
+            "Example: Asha Rao; Ravi Patil; Meena Shah", "Add ramp batch (1/4)"))
+    If names = "" Then Exit Sub
+    lead = ChooseFrom("Add ramp batch (2/4) - team lead", Sh("Teams").Range("A7:A26"))
+    If lead = "" Then Exit Sub
+    grp = ChooseFrom("Add ramp batch (3/4) - target group after ramp-up", Sh("Base_Targets").Range("A7:A16"))
+    If grp = "" Then Exit Sub
+    startD = AskDate("Batch start date (dd-mmm-yyyy):", "Add ramp batch (4/4)", Format(Date, "dd-mmm-yyyy"), ok)
+    If Not ok Then Exit Sub
+    batch = Format(startD, "mmm-yy") & " batch"
+    parts = Split(names, ";")
+    For i = LBound(parts) To UBound(parts)
+        nm = Trim$(parts(i))
+        If Len(nm) > 0 Then
+            n = CreateJoiner(nm, "", lead, grp, startD, True, batch)
+            If n >= 0 Then
+                added = added + 1
+            Else
+                skipped = skipped & nm & "; "
+            End If
         End If
-        rampD = CDate(s)
-        hasRamp = True
-    End If
-    yr = CLng(Sh("Settings").Range("B3").Value)
-    If Year(startD) > yr Then
-        MsgBox "Start date is after the tracker year (" & yr & ").", vbExclamation
+    Next i
+    MsgBox added & " researcher(s) added to " & lead & " and started in " & FirstStage() & "." & _
+           IIf(Len(skipped) > 0, vbLf & "NOT added (already on Roster / invalid): " & skipped, ""), vbInformation, "Done"
+End Sub
+
+' ---------------------------------------------------------------- RAMP STAGE (manual decision)
+Public Sub AdvanceRampStage()
+    Dim r As Long, w As Worksheet, cur As String, nxt As String, c As Range, found As Boolean
+    Dim ok As Boolean, d As Date, wp As Worksheet
+    r = PickEmployeeRow("Advance ramp stage")
+    If r = 0 Then Exit Sub
+    Set w = Sh("Roster")
+    Set wp = Sh("Ramping")
+    cur = Trim$(CStr(w.Cells(r, 7).Value))
+    If cur = "" Or StrComp(cur, "Graduated", vbTextCompare) = 0 Then
+        MsgBox w.Cells(r, 2).Value & " is not currently in the ramping programme.", vbExclamation
         Exit Sub
     End If
-    r = FirstEmptyRow(wr, 2, ROST_FIRST, ROST_LAST)
+    For Each c In wp.Range("F7:F16").Cells
+        If found And Len(Trim$(CStr(c.Value))) > 0 Then
+            nxt = Trim$(CStr(c.Value))
+            Exit For
+        End If
+        If StrComp(Trim$(CStr(c.Value)), cur, vbTextCompare) = 0 Then found = True
+    Next c
+    If nxt = "" Then nxt = "Graduated"
+    d = AskDate(w.Cells(r, 2).Value & ": move from " & cur & " to " & nxt & " starting (dd-mmm-yyyy):", "Advance ramp stage", Format(Date, "dd-mmm-yyyy"), ok)
+    If Not ok Then Exit Sub
+    AppendRampRow CStr(w.Cells(r, 2).Value), d, nxt
+    MsgBox w.Cells(r, 2).Value & " is now " & nxt & " from " & Format(d, "dd-mmm-yyyy") & ".", vbInformation
+End Sub
+
+Public Sub GraduateRamp()
+    Dim r As Long, w As Worksheet, ok As Boolean, d As Date
+    r = PickEmployeeRow("Graduate from ramping")
+    If r = 0 Then Exit Sub
+    Set w = Sh("Roster")
+    d = AskDate("Graduation date for " & w.Cells(r, 2).Value & " (dd-mmm-yyyy):", "Graduate", Format(Date, "dd-mmm-yyyy"), ok)
+    If Not ok Then Exit Sub
+    AppendRampRow CStr(w.Cells(r, 2).Value), d, "Graduated"
+    MsgBox w.Cells(r, 2).Value & " graduates on " & Format(d, "dd-mmm-yyyy") & " and gets the normal target from then on.", vbInformation
+End Sub
+
+Public Sub NewRampTarget()
+    Dim w As Worksheet, stg As String, d As Date, ok As Boolean, v As String, r As Long
+    Set w = Sh("Ramping")
+    stg = ChooseFrom("Ramp target - which stage?", w.Range("F7:F16"))
+    If stg = "" Then Exit Sub
+    d = AskDate("New target for '" & stg & "' applies FROM which date (dd-mmm-yyyy)?", "Ramp target", Format(Date, "dd-mmm-yyyy"), ok)
+    If Not ok Then Exit Sub
+    v = Trim$(InputBox("Target PPD for '" & stg & "':", "Ramp target"))
+    If Not IsNumeric(v) Or v = "" Then
+        MsgBox "Please enter a number.", vbExclamation
+        Exit Sub
+    End If
+    If CDbl(v) <= 0 Then
+        MsgBox "The target must be greater than 0.", vbExclamation
+        Exit Sub
+    End If
+    r = FirstEmptyRow(w, 1, 7, 46)
     If r = 0 Then
-        MsgBox "The Roster is full (400 rows).", vbExclamation
+        MsgBox "The stage-target table is full.", vbExclamation
         Exit Sub
     End If
-    wr.Cells(r, 1).Value = id
-    wr.Cells(r, 2).Value = nm
-    wr.Cells(r, 3).Value = lead
-    wr.Cells(r, 5).Value = startD
-    wr.Cells(r, 8).Value = grp
-    wr.Cells(r, 10).Value = startD
-    If hasRamp Then wr.Cells(r, 7).Value = rampD
-    n = AppendLogRows(nm, startD, DateSerial(yr, 12, 31))
-    MsgBox nm & " added to " & lead & "." & vbLf & n & " daily rows created in Daily_Log (weekends included, shaded).", vbInformation, "Done"
+    w.Cells(r, 1).Value = d
+    w.Cells(r, 1).NumberFormat = "dd-mmm-yyyy"
+    w.Cells(r, 2).Value = stg
+    w.Cells(r, 3).Value = CDbl(v)
+    w.Cells(r, 4).Value = "Added via button on " & Format(Date, "dd-mmm-yyyy")
+    MsgBox "'" & stg & "' target becomes " & v & " from " & Format(d, "dd-mmm-yyyy") & ".", vbInformation
 End Sub
 
 ' ---------------------------------------------------------------- LEAVER
@@ -233,7 +354,7 @@ Public Sub MoveTeam()
         Exit Sub
     End If
     For c = 1 To 11
-        w.Cells(r2, c).Value = w.Cells(r, c).Value
+        If c <> 7 Then w.Cells(r2, c).Value = w.Cells(r, c).Value
     Next c
     w.Cells(r2, 3).Value = newLead
     w.Cells(r2, 5).Value = eff
@@ -242,19 +363,6 @@ Public Sub MoveTeam()
     w.Cells(r, 6).NumberFormat = "dd-mmm-yyyy"
     MsgBox w.Cells(r, 2).Value & " moves to " & newLead & " from " & Format(eff, "dd-mmm-yyyy") & "." & vbLf & _
            "History before that date stays with the old team.", vbInformation
-End Sub
-
-' ---------------------------------------------------------------- RAMP
-Public Sub SetRampEnd()
-    Dim r As Long, w As Worksheet, ok As Boolean, d As Date
-    r = PickEmployeeRow("Ramping to Ramped")
-    If r = 0 Then Exit Sub
-    Set w = Sh("Roster")
-    d = AskDate("First day " & w.Cells(r, 2).Value & " counts as RAMPED (dd-mmm-yyyy):", "Ramping to Ramped", Format(Date, "dd-mmm-yyyy"), ok)
-    If Not ok Then Exit Sub
-    w.Cells(r, 7).Value = d
-    w.Cells(r, 7).NumberFormat = "dd-mmm-yyyy"
-    MsgBox "Done. Phase = Ramping before " & Format(d, "dd-mmm-yyyy") & ", Ramped from then on.", vbInformation
 End Sub
 
 ' ---------------------------------------------------------------- TEAM LEAD
