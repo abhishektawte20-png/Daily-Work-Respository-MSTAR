@@ -12,6 +12,10 @@ Private Const ROST_LAST As Long = 406
 Private Const LOG_FIRST As Long = 7
 Private Const LOG_LASTCOL As Long = 45
 
+' Guardrail state (module-level declarations must stay at the top of the module)
+Public GuardOff As Boolean
+Private mWho As String
+
 Private Function Sh(ByVal n As String) As Worksheet
     Set Sh = ThisWorkbook.Worksheets(n)
 End Function
@@ -112,6 +116,9 @@ Private Function AppendLogRows(ByVal nm As String, ByVal d1 As Date, ByVal d2 As
     Set wl = Sh("Daily_Log")
     n = CLng(d2 - d1) + 1
     If n < 1 Then Exit Function
+    oldCalc = Application.Calculation
+    On Error GoTo fail
+    wl.Unprotect
     firstR = wl.Cells(wl.Rows.Count, 2).End(xlUp).Row + 1
     If firstR < LOG_FIRST Then firstR = LOG_FIRST
     ReDim arr(1 To n, 1 To 2)
@@ -120,7 +127,7 @@ Private Function AppendLogRows(ByVal nm As String, ByVal d1 As Date, ByVal d2 As
         arr(i, 2) = nm
     Next i
     Application.ScreenUpdating = False
-    oldCalc = Application.Calculation
+    Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
     lastF = wl.Cells(wl.Rows.Count, 4).End(xlUp).Row
     If firstR + n - 1 > lastF Then
@@ -133,8 +140,17 @@ Private Function AppendLogRows(ByVal nm As String, ByVal d1 As Date, ByVal d2 As
     wl.Range(wl.Cells(firstR, 1), wl.Cells(firstR + n - 1, 2)).Value = arr
     wl.Range(wl.Cells(firstR, 1), wl.Cells(firstR + n - 1, 1)).NumberFormat = "dd-mmm-yy"
     Application.Calculation = oldCalc
+    Application.EnableEvents = True
     Application.ScreenUpdating = True
+    ApplyGuardrails
     AppendLogRows = n
+    Exit Function
+fail:
+    Application.Calculation = oldCalc
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    MsgBox "Could not create the daily rows: " & Err.Description, vbExclamation
+    AppendLogRows = -1
 End Function
 
 ' ---------------------------------------------------------------- JOINER
@@ -470,10 +486,226 @@ Public Sub SortLogByDate()
     lastR = wl.Cells(wl.Rows.Count, 2).End(xlUp).Row
     If lastR <= LOG_FIRST Then Exit Sub
     If MsgBox("Sort Daily_Log by Date, then Employee? (takes a few seconds)", vbYesNo + vbQuestion) <> vbYes Then Exit Sub
+    On Error GoTo fail
+    wl.Unprotect
     Application.ScreenUpdating = False
+    Application.EnableEvents = False
     wl.Range(wl.Cells(LOG_FIRST, 1), wl.Cells(lastR, LOG_LASTCOL)).Sort _
         Key1:=wl.Cells(LOG_FIRST, 1), Order1:=xlAscending, _
         Key2:=wl.Cells(LOG_FIRST, 2), Order2:=xlAscending, Header:=xlNo
+    Application.EnableEvents = True
     Application.ScreenUpdating = True
+    ApplyGuardrails
     MsgBox "Sorted.", vbInformation
+    Exit Sub
+fail:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    ApplyGuardrails
+    MsgBox "Could not sort: " & Err.Description, vbExclamation
+End Sub
+
+' ============================================================================
+'  GUARDRAILS  - stop people changing someone else's numbers by mistake
+'  (an accident guard, not security: it relies on macros being enabled)
+' ============================================================================
+
+Private Function FindPerson(ByVal s As String) As String
+    Dim c As Range
+    For Each c In Sh("Roster").Range("B" & ROST_FIRST & ":B" & ROST_LAST).Cells
+        If Len(CStr(c.Value)) > 0 Then
+            If StrComp(Trim$(CStr(c.Value)), s, vbTextCompare) = 0 Then
+                FindPerson = Trim$(CStr(c.Value))
+                Exit Function
+            End If
+        End If
+    Next c
+    For Each c In Sh("Teams").Range("A7:A26").Cells
+        If Len(CStr(c.Value)) > 0 Then
+            If StrComp(Trim$(CStr(c.Value)), s, vbTextCompare) = 0 Then
+                FindPerson = Trim$(CStr(c.Value))
+                Exit Function
+            End If
+        End If
+    Next c
+End Function
+
+Private Function IsLead(ByVal s As String) As Boolean
+    Dim c As Range
+    For Each c In Sh("Teams").Range("A7:A26").Cells
+        If Len(CStr(c.Value)) > 0 Then
+            If StrComp(Trim$(CStr(c.Value)), s, vbTextCompare) = 0 Then
+                IsLead = True
+                Exit Function
+            End If
+        End If
+    Next c
+End Function
+
+Private Function AskWho() As String
+    Dim s As String, tries As Long, p As String
+    If Len(mWho) > 0 Then
+        AskWho = mWho
+        Exit Function
+    End If
+    For tries = 1 To 2
+        s = Trim$(InputBox("Who are you?" & vbLf & vbLf & _
+            "Type your full name exactly as it appears on the Roster (team leads: as on the Teams tab)." & vbLf & _
+            "This is only used to stop you changing someone else's numbers by mistake.", "Sign in"))
+        If s = "" Then Exit Function
+        p = FindPerson(s)
+        If p <> "" Then
+            mWho = p
+            AskWho = p
+            Exit Function
+        End If
+        MsgBox "'" & s & "' was not found on the Roster or the Teams tab. Please check the spelling.", vbExclamation, "Sign in"
+    Next tries
+End Function
+
+Public Sub SignIn()
+    mWho = ""
+    If AskWho() <> "" Then MsgBox "You are signed in as " & mWho & ".", vbInformation, "Sign in"
+End Sub
+
+Private Sub RevertEdit(ByVal why As String)
+    Application.EnableEvents = False
+    On Error Resume Next
+    Application.Undo
+    Application.EnableEvents = True
+    On Error GoTo 0
+    MsgBox why, vbExclamation, "Change reverted"
+End Sub
+
+Public Sub CheckEdit(ByVal wsh As Object, ByVal Target As Range)
+    Dim wl As Worksheet, a As Range, r As Long, nm As String, ld As String, who As String
+    Dim nRows As Long, nOther As Long, others As String, shown As Long, owners As String, bulk As Boolean
+    Dim amLead As Boolean, mine As Boolean, ans As Long, r1 As Long, r2 As Long
+    If GuardOff Then Exit Sub
+    If wsh.Name <> "Daily_Log" Then Exit Sub
+    On Error GoTo bail
+    Set wl = Sh("Daily_Log")
+    who = AskWho()
+    If who = "" Then
+        RevertEdit "You did not sign in, so this change was undone." & vbLf & "Click the 'Sign in' button on Daily_Log and try again."
+        Exit Sub
+    End If
+    amLead = IsLead(who)
+    For Each a In Target.Areas
+        r1 = a.Row
+        r2 = a.Row + a.Rows.Count - 1
+        If r1 < LOG_FIRST Then r1 = LOG_FIRST
+        If r2 - r1 > 3000 Then
+            bulk = True
+        Else
+            For r = r1 To r2
+                nm = Trim$(CStr(wl.Cells(r, 2).Value))
+                If Len(nm) > 0 Then
+                    nRows = nRows + 1
+                    ld = Trim$(CStr(wl.Cells(r, 5).Value))
+                    mine = (StrComp(nm, who, vbTextCompare) = 0)
+                    If Not mine And amLead Then mine = (StrComp(ld, who, vbTextCompare) = 0)
+                    If Not mine Then
+                        nOther = nOther + 1
+                        If InStr(1, others, "|" & nm & "|", vbTextCompare) = 0 Then
+                            others = others & "|" & nm & "|"
+                            shown = shown + 1
+                        End If
+                        If InStr(1, owners, "|" & ld & "|", vbTextCompare) = 0 Then owners = owners & "|" & ld & "|"
+                    End If
+                End If
+            Next r
+        End If
+    Next a
+    If bulk Then
+        If Not amLead Then
+            RevertEdit "That change covers thousands of rows (a whole column or sheet area)." & vbLf & "It was undone to protect everyone's numbers. Please edit your own rows only."
+            Exit Sub
+        End If
+        If MsgBox("This change covers a very large number of rows (a whole column / big block)." & vbLf & _
+                  "Are you sure you want to keep it?", vbYesNo + vbExclamation + vbDefaultButton2, "Very large change") <> vbYes Then
+            RevertEdit "Change undone."
+        End If
+        Exit Sub
+    End If
+    If nOther = 0 Then Exit Sub
+    Dim listTxt As String, parts() As String, i As Long
+    parts = Split(Mid$(others, 2, Len(others) - 2), "||")
+    For i = LBound(parts) To UBound(parts)
+        If i < 5 Then listTxt = listTxt & "  - " & parts(i) & vbLf
+    Next i
+    If shown > 5 Then listTxt = listTxt & "  ...and " & (shown - 5) & " more" & vbLf
+    ans = MsgBox("Please double-check before saving this change." & vbLf & vbLf & _
+        "You are signed in as: " & who & vbLf & _
+        "But you just changed numbers for " & shown & " other " & IIf(shown = 1, "person", "people") & " (" & nOther & " row" & IIf(nOther = 1, "", "s") & "):" & vbLf & listTxt & vbLf & _
+        "Did you mean to change someone else's numbers?" & vbLf & "(Common cause: copy-pasting several rows or columns.)", _
+        vbYesNo + vbExclamation + vbDefaultButton2, "Are you editing the right person?")
+    If ans <> vbYes Then
+        RevertEdit "Change undone. Nothing was saved to the other row(s)."
+        Exit Sub
+    End If
+    If amLead Then
+        If MsgBox("You are signed in as team lead " & who & ", but these rows belong to another team." & vbLf & vbLf & _
+                  "Do you still want to keep this change?", vbYesNo + vbQuestion + vbDefaultButton2, "Outside your team") <> vbYes Then
+            RevertEdit "Change undone."
+        End If
+        Exit Sub
+    End If
+    ans = MsgBox("Are you a team lead?", vbYesNo + vbQuestion + vbDefaultButton2, "Team lead check")
+    If ans <> vbYes Then
+        RevertEdit "Only team leads can change other people's numbers." & vbLf & "Your change was undone."
+        Exit Sub
+    End If
+    RevertEdit "You are signed in as " & who & ", who is not listed as a team lead on the Teams tab." & vbLf & vbLf & _
+               "The change was undone. A team lead should click 'Sign in' (Daily_Log) and sign in under their own name first."
+    Exit Sub
+bail:
+    Application.EnableEvents = True
+End Sub
+
+Private Sub LockSheet(ByVal nm As String, ByVal unlockAddr As String)
+    Dim w As Worksheet
+    Set w = Sh(nm)
+    w.Unprotect
+    w.Cells.Locked = True
+    If Len(unlockAddr) > 0 Then w.Range(unlockAddr).Locked = False
+    w.Protect DrawingObjects:=True, Contents:=True, Scenarios:=True, UserInterfaceOnly:=True
+End Sub
+
+Public Sub ApplyGuardrails()
+    Dim wl As Worksheet, lastR As Long
+    If GuardOff Then Exit Sub
+    On Error GoTo bail
+    Set wl = Sh("Daily_Log")
+    lastR = wl.Cells(wl.Rows.Count, 4).End(xlUp).Row
+    wl.Unprotect
+    wl.Cells.Locked = True
+    wl.Range("H" & LOG_FIRST & ":I" & lastR).Locked = False
+    wl.Range("K" & LOG_FIRST & ":AF" & lastR).Locked = False
+    wl.Protect DrawingObjects:=False, Contents:=True, Scenarios:=False, UserInterfaceOnly:=True, _
+               AllowFormattingColumns:=True, AllowFiltering:=True
+    LockSheet "Dashboard", "C3"
+    LockSheet "Team_View", "C4:C5"
+    LockSheet "Due_Diligence", ""
+    LockSheet "Calc", ""
+bail:
+End Sub
+
+Public Sub GuardrailsOnOff()
+    Dim nm As Variant
+    If GuardOff Then
+        GuardOff = False
+        ApplyGuardrails
+        MsgBox "Guardrails are ON: formulas are locked and edits to other people's rows are checked.", vbInformation
+    Else
+        If MsgBox("Turn guardrails OFF?" & vbLf & "Formula sheets will be unprotected and edit checks stop until you reopen the file or switch them on again.", _
+                  vbYesNo + vbExclamation + vbDefaultButton2, "Guardrails") <> vbYes Then Exit Sub
+        GuardOff = True
+        On Error Resume Next
+        For Each nm In Array("Daily_Log", "Dashboard", "Team_View", "Due_Diligence", "Calc")
+            Sh(CStr(nm)).Unprotect
+        Next nm
+        On Error GoTo 0
+        MsgBox "Guardrails are OFF.", vbInformation
+    End If
 End Sub
